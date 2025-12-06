@@ -27,7 +27,7 @@ typedef struct png_mem_file {
 /* global variables */
 
 png_mem_file png_mf;
-png_structp  png_write;
+png_structp  png_write = NULL;
 png_infop    img_info;
 
 static png_uint_32 frame_count;
@@ -42,18 +42,26 @@ static void pngldg_write(png_structp png_ptr, png_bytep data, png_size_t count)
   png_mem_file *mf = (png_mem_file *) png_get_io_ptr(png_ptr);
     
   uint32_t new_size;
+  uint8_t * new_mem;
    
   if (mf->offset + count > mf->size)
   {
     new_size = 2 * mf->size;
       
     if (mf->offset + count > new_size) { new_size = (((mf->offset + count + 15) >> 4) << 4); }
-      
-    mf->data = realloc(mf->data, new_size);
-      
-    if (mf->data == NULL) { return; }
-      
+    
+    // start realloc
+    new_mem = (uint8_t *)png_malloc(png_ptr, new_size);
+    
+    if (new_mem == NULL) { return; }
+    
+    memcpy(new_mem, mf->data, mf->offset);
+     
+    png_free(png_ptr, mf->data);
+
+    mf->data = new_mem;
     mf->size = new_size;
+    // end realloc
   }
     
   memcpy(mf->data + mf->offset, data, count);
@@ -68,17 +76,37 @@ void pngldg_free(png_struct *png_ptr, void *ptr) { ldg_Free(ptr); }
 
 const char * CDECL pngenc_get_lib_version() { return VERSION_LIB(PNG_LIBPNG_VER_MAJOR, PNG_LIBPNG_VER_MINOR, PNG_LIBPNG_VER_RELEASE); }
 
-int32_t CDECL pngenc_open(uint32_t width, uint32_t height, uint32_t depth, uint32_t colortype, uint32_t frames_count, uint32_t plays_count)
+int32_t CDECL pngenc_close()
 {
-  int size = (width * height) + 1024 + 7; size &= ~7;
-  
-  png_mf.data = malloc(size);
-  png_mf.size = size;
+  if (png_write != NULL) { png_free(png_write, png_mf.data); }
+
+  png_mf.data = NULL;
+  png_mf.size = 0;
   png_mf.offset = 0;
 
-  if (png_mf.data == NULL) { return PNG_ERROR; }
+  frame_count = 0;
+  frame_idx = 0;
+  image_height = 0;
+  image_rowbytes = 0;
 
-  png_write  = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);//, NULL, pngldg_malloc, pngldg_free);
+  if (png_write && img_info)
+  {
+    png_write_end(png_write, img_info);
+    png_destroy_write_struct(&png_write, &img_info);
+
+    png_write = NULL;
+
+    return PNG_OK;
+  }
+  return PNG_ERROR;
+}
+int32_t CDECL pngenc_open(uint32_t width, uint32_t height, uint32_t depth, uint32_t colortype, uint32_t frames_count, uint32_t plays_count)
+{
+  if (png_write != NULL) { pngenc_close(); }
+  
+  int size = (width * height) + 1024 + 7; size &= ~7;
+
+  png_write  = png_create_write_struct_2(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL, NULL, pngldg_malloc, pngldg_free);
   img_info = png_create_info_struct(png_write);
   
   frame_count = frames_count;
@@ -87,6 +115,12 @@ int32_t CDECL pngenc_open(uint32_t width, uint32_t height, uint32_t depth, uint3
 
   if (png_write && img_info)
   {
+    png_mf.data = png_malloc(png_write, size);
+    png_mf.size = size;
+    png_mf.offset = 0;
+
+    if (png_mf.data == NULL) { return PNG_ERROR; }
+
     if (setjmp(png_jmpbuf(png_write))) { png_destroy_write_struct(&png_write, &img_info); return PNG_ERROR; }
     
     png_set_write_fn(png_write, &png_mf, pngldg_write, pngldg_flush);
@@ -105,11 +139,13 @@ int32_t CDECL pngenc_open(uint32_t width, uint32_t height, uint32_t depth, uint3
   return PNG_ERROR;
 }
 
-int32_t CDECL pngenc_add_image(uint32_t left, uint32_t top, uint32_t width, uint32_t height, uint32_t delay_num, uint32_t delay_den, uint32_t dispose_op, uint32_t blend_op, uint8_t *p_frame)
+int32_t CDECL pngenc_add_frame(uint32_t left, uint32_t top, uint32_t width, uint32_t height, uint32_t delay_num, uint32_t delay_den, uint32_t dispose_op, uint32_t blend_op, uint8_t *p_frame)
 {
+  if (png_write == NULL) { return PNG_ERROR; }
+
   if (png_write && img_info)
   {
-    png_bytepp rows = (png_bytepp)malloc(image_height * sizeof(png_bytep));
+    png_bytepp rows = (png_bytepp)png_malloc(png_write, image_height * sizeof(png_bytep));
 
     if (p_frame && rows)
     {
@@ -129,7 +165,7 @@ int32_t CDECL pngenc_add_image(uint32_t left, uint32_t top, uint32_t width, uint
       }
   
       frame_idx++;
-      free(rows);
+      png_free(png_write, rows);
     }
 
     return PNG_OK;
@@ -137,33 +173,21 @@ int32_t CDECL pngenc_add_image(uint32_t left, uint32_t top, uint32_t width, uint
   return PNG_ERROR;
 }
 
-int32_t CDECL pngenc_write() { if (png_write && img_info) { png_write_end(png_write, img_info); return PNG_OK; } return PNG_ERROR; }
-
-uint8_t* CDECL pngenc_get_filedata() { return png_mf.data; }
-uint32_t CDECL pngenc_get_filesize() { return png_mf.offset; }
-
-int32_t CDECL pngenc_close()
+int32_t CDECL pngenc_write()
 {
-  free(png_mf.data);
-
-  png_mf.data = NULL;
-  png_mf.size = 0;
-  png_mf.offset = 0;
-
-  frame_count = 0;
-  frame_idx = 0;
-  image_height = 0;
-  image_rowbytes = 0;
-
+  if (png_write == NULL) { return PNG_ERROR; }
+  
   if (png_write && img_info)
   {
     png_write_end(png_write, img_info);
-    png_destroy_write_struct(&png_write, &img_info);
-
+    
     return PNG_OK;
   }
   return PNG_ERROR;
 }
+
+uint8_t* CDECL pngenc_get_filedata() { if (png_write == NULL) { return NULL; } return png_mf.data; }
+uint32_t CDECL pngenc_get_filesize() { if (png_write == NULL) { return 0; } return png_mf.offset; }
 
 /* populate functions list and info for the LDG */
 
@@ -173,7 +197,7 @@ PROC LibFunc[] =
    
   {"pngenc_open", "int32_t pngenc_open(uint32_t width, uint32_t height, uint32_t depth, uint32_t colortype, uint32_t frames_count, uint32_t plays_count);\n", pngenc_open},
   
-  {"pngenc_add_image", "int32_t pngenc_add_image(uint32_t left, uint32_t top, uint32_t width, uint32_t height, uint32_t delay_num, uint32_t delay_den, uint32_t dispose_op, uint32_t blend_op, const uint8_t *p_frame);\n", pngenc_add_image},
+  {"pngenc_add_frame", "int32_t pngenc_add_frame(uint32_t left, uint32_t top, uint32_t width, uint32_t height, uint32_t delay_num, uint32_t delay_den, uint32_t dispose_op, uint32_t blend_op, const uint8_t *p_frame);\n", pngenc_add_frame},
   
   {"pngenc_write", "uint32_t pngenc_write();\n", pngenc_write},
   {"pngenc_get_filedata", "uint8_t* pngenc_get_filedata();\n", pngenc_get_filedata},
